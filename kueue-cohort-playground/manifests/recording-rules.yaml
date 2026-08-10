@@ -1,0 +1,183 @@
+# Recording Rules for the "Missing Denominator" Problem
+#
+# These rules project ClusterQueue-level quota data into user-accessible
+# namespaces via the LocalQueue→ClusterQueue mapping, producing NEW
+# derived metrics (kueue: prefix) that carry a `namespace` label and
+# pass through OpenShift's Thanos prom-label-proxy on port 9092.
+#
+# Uses kueue_cohort_subtree_quota to incorporate the full Cohort hierarchy
+# (including parent Cohort nominalQuota pools), not just sibling CQ lending.
+# Accurate for both flat and hierarchical Cohort topologies — see README
+# for the pessimistic-floor caveat on subtree_reservations.
+#
+# The LQ→CQ join metric (Group 1) is the critical gap: no upstream
+# kueue_local_queue_info{cluster_queue} metric exists. This file includes
+# a hard-coded version for the lab. The lq-info-exporter deployment
+# provides the production-viable dynamic alternative.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kueue-denominator-rules
+  namespace: monitoring
+  labels:
+    lab: denominator
+spec:
+  groups:
+
+    # =========================================================================
+    # Group 1: LQ→CQ Join Metric (the missing upstream piece)
+    #
+    # Hard-coded for the lab topology. In production, the lq-info-exporter
+    # pod generates this dynamically from the K8s API.
+    # =========================================================================
+    - name: kueue-lq-info
+      interval: 15s
+      rules:
+        # Hierarchical topology
+        - record: kueue:local_queue_info
+          labels:
+            name: default
+            namespace: team-ml-project
+            cluster_queue: team-ml
+          expr: "1"
+        - record: kueue:local_queue_info
+          labels:
+            name: default
+            namespace: team-nlp-project
+            cluster_queue: team-nlp
+          expr: "1"
+        - record: kueue:local_queue_info
+          labels:
+            name: default
+            namespace: serving-project
+            cluster_queue: serving
+          expr: "1"
+        # Flat topology
+        - record: kueue:local_queue_info
+          labels:
+            name: default
+            namespace: team-a-project
+            cluster_queue: team-a
+          expr: "1"
+        - record: kueue:local_queue_info
+          labels:
+            name: default
+            namespace: team-b-project
+            cluster_queue: team-b
+          expr: "1"
+
+    # =========================================================================
+    # Group 2: Guaranteed Quota (projected to namespace)
+    #
+    # Stable value — only changes when admin reconfigures CQ quotas.
+    # This is the "denominator" for the guaranteed tier.
+    # =========================================================================
+    - name: kueue-quota-guaranteed
+      interval: 30s
+      rules:
+        - record: kueue:namespace_guaranteed_quota
+          expr: |
+            kueue_cluster_queue_nominal_quota
+              * on(cluster_queue) group_left(name, namespace)
+              kueue:local_queue_info
+
+    # =========================================================================
+    # Group 3: Cohort Available Capacity (per-CQ intermediate)
+    #
+    # How much capacity from the Cohort subtree is available to each CQ,
+    # incorporating the full hierarchy via kueue_cohort_subtree_quota.
+    #
+    # Formula: subtree_quota - subtree_reservations + cq_usage
+    #          - min(cq_nominal, cq_lending_limit)
+    #
+    # subtree_quota is pre-aggregated by Kueue — it already includes
+    # Cohort nominalQuota pools AND respects lending limits across the
+    # hierarchy. No PromQL tree walk needed.
+    #
+    # subtree_reservations is absent for idle cohorts (no workloads in
+    # the subtree), so we fall back to 0 via `or subtree_quota * 0`.
+    #
+    # Must be a separate rule: referenced twice by the filter-or min
+    # pattern in the borrowable computation below.
+    # =========================================================================
+    - name: kueue-cohort-available
+      interval: 30s
+      rules:
+        - record: kueue:cq_cohort_available
+          expr: |
+            kueue_cluster_queue_resource_usage
+              + on(cohort, flavor, resource) group_left()
+              (
+                kueue_cohort_subtree_quota
+                  - ((kueue_cohort_subtree_resource_reservations + 0)
+                     or (kueue_cohort_subtree_quota * 0))
+              )
+            - (
+              kueue_cluster_queue_nominal_quota
+                <= kueue_cluster_queue_lending_limit
+              or
+              kueue_cluster_queue_lending_limit
+                < kueue_cluster_queue_nominal_quota
+            )
+
+    # =========================================================================
+    # Group 4: Borrowable Quota
+    #
+    # Borrowable = min(borrowingLimit, cq_cohort_available), clamped >= 0,
+    # projected to namespace via the LQ join.
+    #
+    # Uses the filter-or pattern for element-wise min to avoid
+    # 0 * +Inf = NaN when borrowingLimit is unset (+Inf).
+    # =========================================================================
+    - name: kueue-quota-borrowable
+      interval: 30s
+      rules:
+        - record: kueue:namespace_borrowable_quota
+          expr: |
+            clamp_min(
+              kueue_cluster_queue_borrowing_limit
+                <= kueue:cq_cohort_available
+              or
+              kueue:cq_cohort_available
+                < kueue_cluster_queue_borrowing_limit,
+              0
+            ) * on(cluster_queue) group_left(name, namespace)
+              kueue:local_queue_info
+
+    # =========================================================================
+    # Group 5: Usage (projected to namespace)
+    #
+    # All Kueue metrics — including kueue_local_queue_resource_usage —
+    # carry namespace=kueue-system (the controller's namespace), not the
+    # user's project namespace. Without this rule, the data scientist has
+    # the denominator but not the numerator.
+    # =========================================================================
+    - name: kueue-usage
+      interval: 15s
+      rules:
+        - record: kueue:namespace_resource_usage
+          expr: |
+            kueue_cluster_queue_resource_usage
+              * on(cluster_queue) group_left(name, namespace)
+              kueue:local_queue_info
+
+    # =========================================================================
+    # Derived metrics (not recording rules — compute in Grafana / PromQL)
+    #
+    # All kueue:namespace_* metrics share the same label set, so these
+    # queries work without explicit join modifiers:
+    #
+    #   Effective ceiling (guaranteed + borrowable):
+    #     kueue:namespace_guaranteed_quota + kueue:namespace_borrowable_quota
+    #
+    #   Guaranteed remaining:
+    #     kueue:namespace_guaranteed_quota - kueue:namespace_resource_usage
+    #
+    #   Headroom before workloads queue:
+    #     kueue:namespace_guaranteed_quota
+    #       + kueue:namespace_borrowable_quota
+    #       - kueue:namespace_resource_usage
+    #
+    #   Utilization ratio:
+    #     kueue:namespace_resource_usage / kueue:namespace_guaranteed_quota
+    # =========================================================================

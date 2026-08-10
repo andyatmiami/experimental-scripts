@@ -1,0 +1,105 @@
+# Flat Cohort Topology
+# Two sibling ClusterQueues sharing via a single Cohort (no hierarchy).
+# Simpler test case for recording rules that don't need tree recursion.
+#
+# Topology:
+#   Cohort "shared-pool" (nominalQuota: 1000m)
+#     ├── CQ "team-a" (nominal: 1000m, borrowLim: 1000m, lendLim: 500m)
+#     │     └── LQ "default" in ns "team-a-project"
+#     └── CQ "team-b" (nominal: 1000m, borrowLim: 1000m, lendLim: 1000m)
+#           └── LQ "default" in ns "team-b-project"
+
+---
+# Namespaces
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-a-project
+  labels:
+    lab: denominator
+    topology: flat
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-b-project
+  labels:
+    lab: denominator
+    topology: flat
+
+---
+# Cohort: shared-pool (no parent — flat)
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Cohort
+metadata:
+  name: shared-pool
+spec:
+  resourceGroups:
+    - coveredResources: ["cpu"]
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "1"
+
+---
+# ClusterQueue: team-a
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: team-a
+spec:
+  cohortName: shared-pool
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "1"
+              borrowingLimit: "1"
+              lendingLimit: "500m"
+            - name: "memory"
+              nominalQuota: "4Gi"
+
+---
+# ClusterQueue: team-b
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: team-b
+spec:
+  cohortName: shared-pool
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "1"
+              borrowingLimit: "1"
+              lendingLimit: "1"
+            - name: "memory"
+              nominalQuota: "4Gi"
+
+---
+# LocalQueue: default in team-a-project -> team-a
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: default
+  namespace: team-a-project
+spec:
+  clusterQueue: team-a
+
+---
+# LocalQueue: default in team-b-project -> team-b
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: default
+  namespace: team-b-project
+spec:
+  clusterQueue: team-b

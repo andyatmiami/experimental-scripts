@@ -1,0 +1,191 @@
+# Hierarchical Cohort Topology
+# Reproduces the worked example from kueue-quota-visibility-rbac-analysis.md
+# using CPU millicores instead of GPUs.
+#
+# Topology:
+#   Cohort "org-wide" (root, nominal: 1000m)
+#     ├── Cohort "research" (nominal: 2000m, borrowLim: 1000m, lendLim: 1000m)
+#     │     ├── CQ "team-ml" (nominal: 1000m, borrowLim: 1500m, lendLim: 500m)
+#     │     │     └── LQ "default" in ns "team-ml-project"
+#     │     └── CQ "team-nlp" (nominal: 1000m, borrowLim: 500m, lendLim: 500m)
+#     │           └── LQ "default" in ns "team-nlp-project"
+#     └── Cohort "production" (nominal: 0, borrowLim: 500m, lendLim: 0)
+#           └── CQ "serving" (nominal: 2000m, borrowLim: 500m, lendLim: unlimited)
+#                 └── LQ "default" in ns "serving-project"
+
+---
+# Namespaces
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-ml-project
+  labels:
+    lab: denominator
+    topology: hierarchical
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-nlp-project
+  labels:
+    lab: denominator
+    topology: hierarchical
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: serving-project
+  labels:
+    lab: denominator
+    topology: hierarchical
+
+---
+# ResourceFlavor (shared across all topologies)
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ResourceFlavor
+metadata:
+  name: default-flavor
+spec: {}
+
+---
+# Cohort: org-wide (root)
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Cohort
+metadata:
+  name: org-wide
+spec:
+  resourceGroups:
+    - coveredResources: ["cpu"]
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "1"
+
+---
+# Cohort: research (child of org-wide)
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Cohort
+metadata:
+  name: research
+spec:
+  parentName: org-wide
+  resourceGroups:
+    - coveredResources: ["cpu"]
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "2"
+              borrowingLimit: "1"
+              lendingLimit: "1"
+
+---
+# Cohort: production (child of org-wide)
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: Cohort
+metadata:
+  name: production
+spec:
+  parentName: org-wide
+  resourceGroups:
+    - coveredResources: ["cpu"]
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "0"
+              borrowingLimit: "500m"
+              lendingLimit: "0"
+
+---
+# ClusterQueue: team-ml (in research Cohort)
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: team-ml
+spec:
+  cohortName: research
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "1"
+              borrowingLimit: "1500m"
+              lendingLimit: "500m"
+            - name: "memory"
+              nominalQuota: "4Gi"
+
+---
+# ClusterQueue: team-nlp (in research Cohort)
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: team-nlp
+spec:
+  cohortName: research
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "1"
+              borrowingLimit: "500m"
+              lendingLimit: "500m"
+            - name: "memory"
+              nominalQuota: "4Gi"
+
+---
+# ClusterQueue: serving (in production Cohort)
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: ClusterQueue
+metadata:
+  name: serving
+spec:
+  cohortName: production
+  namespaceSelector: {}
+  resourceGroups:
+    - coveredResources: ["cpu", "memory"]
+      flavors:
+        - name: default-flavor
+          resources:
+            - name: "cpu"
+              nominalQuota: "2"
+              borrowingLimit: "500m"
+            - name: "memory"
+              nominalQuota: "8Gi"
+
+---
+# LocalQueue: default in team-ml-project -> team-ml
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: default
+  namespace: team-ml-project
+spec:
+  clusterQueue: team-ml
+
+---
+# LocalQueue: default in team-nlp-project -> team-nlp
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: default
+  namespace: team-nlp-project
+spec:
+  clusterQueue: team-nlp
+
+---
+# LocalQueue: default in serving-project -> serving
+apiVersion: kueue.x-k8s.io/v1beta2
+kind: LocalQueue
+metadata:
+  name: default
+  namespace: serving-project
+spec:
+  clusterQueue: serving
